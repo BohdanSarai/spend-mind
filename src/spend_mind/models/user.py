@@ -8,6 +8,7 @@ from spend_mind.models.base import Base
 
 if TYPE_CHECKING:
     from spend_mind.models.category import Category
+    from spend_mind.models.expense import Expense
 
 
 class User(Base):
@@ -22,3 +23,4 @@ class User(Base):
     )
 
     categories: Mapped[list["Category"]] = relationship(back_populates="user")
+    expenses: Mapped[list["Expense"]] = relationship(back_populates="user")
