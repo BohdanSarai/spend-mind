@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from spend_mind.models.base import Base
 
 if TYPE_CHECKING:
+    from spend_mind.models.expense_item import ExpenseItem
     from spend_mind.models.user import User
 
 
@@ -20,3 +21,6 @@ class Category(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
 
     user: Mapped["User"] = relationship(back_populates="categories")
+    expense_items: Mapped[list["ExpenseItem"]] = relationship(
+        back_populates="category", passive_deletes="all"
+    )

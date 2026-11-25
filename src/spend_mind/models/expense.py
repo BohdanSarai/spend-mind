@@ -18,6 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from spend_mind.models.base import Base
 
 if TYPE_CHECKING:
+    from spend_mind.models.expense_item import ExpenseItem
     from spend_mind.models.user import User
 
 
@@ -91,3 +92,8 @@ class Expense(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="expenses")
+    items: Mapped[list["ExpenseItem"]] = relationship(
+        back_populates="expense",
+        cascade="save-update, merge, delete, delete-orphan",
+        passive_deletes=True,
+    )

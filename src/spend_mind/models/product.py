@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from spend_mind.models.base import Base
 
 if TYPE_CHECKING:
+    from spend_mind.models.expense_item import ExpenseItem
     from spend_mind.models.product_type import ProductType
 
 
@@ -21,3 +22,6 @@ class Product(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
 
     product_type: Mapped["ProductType"] = relationship(back_populates="products")
+    expense_items: Mapped[list["ExpenseItem"]] = relationship(
+        back_populates="product", passive_deletes="all"
+    )
