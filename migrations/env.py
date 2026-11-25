@@ -6,10 +6,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from spend_mind.config import Settings
+from spend_mind.models import Base
 
 
 def run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection)
+    context.configure(connection=connection, target_metadata=Base.metadata)
     with context.begin_transaction():
         context.run_migrations()
 
@@ -24,7 +25,7 @@ async def run_migrations_online() -> None:
 
 
 if context.is_offline_mode():
-    context.configure(dialect_name="postgresql")
+    context.configure(dialect_name="postgresql", target_metadata=Base.metadata)
     with context.begin_transaction():
         context.run_migrations()
 else:
