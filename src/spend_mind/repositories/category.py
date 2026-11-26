@@ -26,6 +26,18 @@ async def lock_categories(
     return {category.id: category for category in await session.scalars(statement)}
 
 
+async def lock_owned_category_ids_for_reference(
+    session: AsyncSession, user_id: int, ids: set[int]
+) -> set[int]:
+    statement = (
+        select(Category.id)
+        .where(Category.user_id == user_id, Category.id.in_(ids))
+        .order_by(Category.id)
+        .with_for_update(read=True, key_share=True)
+    )
+    return set(await session.scalars(statement))
+
+
 async def create_category(session: AsyncSession, user_id: int, name: str) -> Category:
     category = Category(user_id=user_id, name=name)
     session.add(category)
