@@ -120,3 +120,12 @@ class ExpenseResponse(BaseModel):
     source: ExpenseSource
     status: ExpenseStatus
     items: list[ExpenseItemResponse]
+
+
+class ExpenseTransitionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    status: ExpenseStatus
+    exchange_rate: Decimal | None
+    amount_uah: Decimal | None
