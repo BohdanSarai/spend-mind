@@ -1,7 +1,7 @@
 from secrets import compare_digest
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 bearer = HTTPBearer(auto_error=False)
@@ -24,3 +24,15 @@ async def require_internal_token(
         detail="Invalid internal API credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+async def get_telegram_actor(
+    telegram_user_id: Annotated[
+        int | None, Header(alias="X-Telegram-User-Id", gt=0, le=2**63 - 1)
+    ] = None,
+    *,
+    authenticated: Annotated[None, Depends(require_internal_token)],
+) -> int:
+    if telegram_user_id is None:
+        raise HTTPException(status_code=422, detail="X-Telegram-User-Id is required")
+    return telegram_user_id

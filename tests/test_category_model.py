@@ -1,4 +1,6 @@
 from sqlalchemy import Integer, String, UniqueConstraint
+from sqlalchemy.dialects.postgresql import dialect
+from sqlalchemy.schema import CreateIndex
 
 from spend_mind.models import Base, Category, User
 
@@ -30,7 +32,13 @@ def test_category_columns_and_constraints() -> None:
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
     }
-    assert unique_constraints == {"uq_categories_user_id_name": ["user_id", "name"]}
+    assert not unique_constraints
+    (index,) = table.indexes
+    assert index.unique
+    assert str(CreateIndex(index).compile(dialect=dialect())) == (
+        "CREATE UNIQUE INDEX uq_categories_user_id_lower_name "
+        "ON categories (user_id, lower(name))"
+    )
 
 
 def test_adding_category_to_user_sets_its_owner() -> None:

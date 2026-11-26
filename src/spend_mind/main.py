@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from spend_mind.config import Settings
+from spend_mind.routers.categories import router as categories_router
 from spend_mind.routers.users import router as users_router
 
 
@@ -28,6 +29,7 @@ class HealthResponse(BaseModel):
 
 app = FastAPI(title="SpendMind", lifespan=lifespan)
 app.include_router(users_router)
+app.include_router(categories_router)
 
 
 @app.get("/health")
