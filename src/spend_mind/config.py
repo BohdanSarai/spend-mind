@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     postgres_db: str = Field(min_length=1)
     postgres_user: str = Field(min_length=1)
     postgres_password: SecretStr = Field(min_length=1)
+    internal_api_token: SecretStr | None = None
 
     @property
     def database_url(self) -> URL:

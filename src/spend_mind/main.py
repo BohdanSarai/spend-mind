@@ -7,12 +7,15 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from spend_mind.config import Settings
+from spend_mind.routers.users import router as users_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    engine = create_async_engine(Settings().database_url, pool_pre_ping=True)
+    settings = Settings()
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     try:
+        app.state.settings = settings
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
         yield
     finally:
@@ -24,6 +27,7 @@ class HealthResponse(BaseModel):
 
 
 app = FastAPI(title="SpendMind", lifespan=lifespan)
+app.include_router(users_router)
 
 
 @app.get("/health")
