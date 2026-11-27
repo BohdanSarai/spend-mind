@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from spend_mind.config import Settings
+from spend_mind.integrations.openai import OpenAIResponses
 from spend_mind.routers.categories import router as categories_router
 from spend_mind.routers.expenses import router as expenses_router
 from spend_mind.routers.users import router as users_router
@@ -19,7 +20,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         app.state.settings = settings
         app.state.session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        yield
+        openai_responses = OpenAIResponses.from_settings(settings)
+        app.state.openai_responses = openai_responses
+        try:
+            yield
+        finally:
+            if openai_responses is not None:
+                await openai_responses.close()
     finally:
         await engine.dispose()
 
