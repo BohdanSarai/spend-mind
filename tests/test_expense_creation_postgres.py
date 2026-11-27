@@ -17,6 +17,9 @@ from spend_mind.integrations import nbu
 from spend_mind.main import app
 from spend_mind.models import Category, Expense, ExpenseItem
 from spend_mind.repositories import expense as expense_repository
+from spend_mind.repositories import expense_item as item_repository
+from spend_mind.schemas.expense import ExpenseItemCreate
+from spend_mind.services import expense as expense_service
 from spend_mind.services.user_registration import register_user
 
 ENDPOINT = "/internal/expenses"
@@ -111,6 +114,348 @@ async def create_pending(
     )
     assert response.status_code == 201
     return response.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_expense_list_filters_by_owner_status_date_and_cursor(
+    api: tuple[httpx.AsyncClient, str], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    other, _, _ = await add_user(sessions, token)
+    first = await create_pending(client, owner)
+    second = await create_pending(client, owner)
+    rejected = await create_pending(client, owner)
+    pending = await create_pending(client, owner)
+    foreign = await create_pending(client, other)
+    for headers, expense_id in [(owner, first), (owner, second), (other, foreign)]:
+        assert (
+            await client.post(f"{ENDPOINT}/{expense_id}/confirm", headers=headers)
+        ).status_code == 200
+    assert (
+        await client.post(f"{ENDPOINT}/{rejected}/reject", headers=owner)
+    ).status_code == 200
+    params = {"limit": 1, "date_from": "2026-11-28", "date_to": "2026-11-28"}
+    page = await client.get(ENDPOINT, headers=owner, params=params)
+    assert page.status_code == 200, page.text
+    assert [item["id"] for item in page.json()["items"]] == [second]
+    next_page = await client.get(
+        ENDPOINT, headers=owner, params=params | {"cursor": page.json()["next_cursor"]}
+    )
+    assert [item["id"] for item in next_page.json()["items"]] == [first]
+    assert next_page.json()["next_cursor"] is None
+    for state, expected in [
+        ("pending", [pending]),
+        ("rejected", [rejected]),
+        ("all", [pending, rejected, second, first]),
+    ]:
+        response = await client.get(ENDPOINT, headers=owner, params={"status": state})
+        assert [item["id"] for item in response.json()["items"]] == expected
+    response = await client.get(
+        ENDPOINT, headers=owner, params={"date_to": "2026-11-27"}
+    )
+    assert response.json() == {"items": [], "next_cursor": None}
+    for filters in [
+        {"cursor": "!"},
+        {"limit": 101},
+        {"status": "invalid"},
+        {"date_from": "1760000000"},
+        {"user_id": 123},
+        {"date_from": "2026-11-29", "date_to": "2026-11-28"},
+    ]:
+        assert (
+            await client.get(ENDPOINT, headers=owner, params=filters)
+        ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_patch_rolls_back_expense_and_existing_items_on_insert_failure(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    expense_id = await create_pending(client, owner)
+    path = f"{ENDPOINT}/{expense_id}"
+    before = await client.get(path, headers=owner)
+    build_items = expense_service.build_expense_items
+
+    def build_invalid_items(
+        items: list[ExpenseItemCreate], amounts: list[Decimal]
+    ) -> list[ExpenseItem]:
+        result = build_items(items, amounts)
+        result[-1].amount = Decimal(-1)
+        return result
+
+    monkeypatch.setattr(expense_service, "build_expense_items", build_invalid_items)
+    with pytest.raises(IntegrityError):
+        await client.patch(
+            path,
+            headers=owner | {"If-Match": before.headers["etag"]},
+            json={
+                "merchant": "Changed",
+                "items": [{"name": "Replacement", "amount": "2.99"}],
+            },
+        )
+    after = await client.get(path, headers=owner)
+    assert after.json() == before.json()
+    assert after.headers["etag"] == before.headers["etag"]
+
+
+@pytest.mark.asyncio
+async def test_patch_reuses_validation_and_preserves_already_discounted_items(
+    api: tuple[httpx.AsyncClient, str], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    other, _, foreign_category = await add_user(sessions, token)
+    expense_id = await create_pending(client, owner)
+    path = f"{ENDPOINT}/{expense_id}"
+    detail = await client.get(path, headers=owner)
+    assert detail.status_code == 200
+    assert (await client.get(path, headers=other)).status_code == 404
+    assert (
+        await client.patch(path, headers=owner, json={"merchant": "Shop"})
+    ).status_code == 428
+    tag = detail.headers["etag"]
+    tagged = owner | {"If-Match": tag}
+    assert (
+        await client.patch(
+            path, headers=other | {"If-Match": tag}, json={"merchant": "X"}
+        )
+    ).status_code == 404
+    for changes in (
+        {},
+        {"status": "confirmed"},
+        {"items": []},
+        {"currency": "GBP"},
+        {"receipt_discount": "0.01"},
+        {"total_amount": "1.10"},
+        {"currency": None},
+    ):
+        assert (
+            await client.patch(path, headers=tagged, json=changes)
+        ).status_code == 422
+    replacement = [{"name": "C", "amount": "2.99", "category_id": foreign_category}]
+    assert (
+        await client.patch(path, headers=tagged, json={"items": replacement})
+    ).status_code == 404
+    assert (await client.get(path, headers=owner)).headers["etag"] == tag
+
+    updated = await client.patch(path, headers=tagged, json={"merchant": "Shop"})
+    assert updated.status_code == 200
+    assert updated.json()["items"] == detail.json()["items"]
+    assert [item["amount"] for item in updated.json()["items"]] == ["1.00", "1.99"]
+    assert updated.headers["etag"] != tag
+    assert (
+        await client.patch(path, headers=tagged, json={"merchant": None})
+    ).status_code == 412
+
+    replaced = await client.patch(
+        path,
+        headers=owner | {"If-Match": updated.headers["etag"]},
+        json={
+            "merchant": None,
+            "total_amount": "2",
+            "receipt_discount": "1",
+            "items": [{"name": "New", "amount": "3"}],
+        },
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["merchant"] is None
+    assert [item["amount"] for item in replaced.json()["items"]] == ["2.00"]
+    assert (await client.get(path, headers=owner)).headers["etag"] == replaced.headers[
+        "etag"
+    ]
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ExpenseItem)
+                .where(ExpenseItem.expense_id == expense_id)
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["pending", "confirmed", "rejected"])
+async def test_delete_any_status_requires_confirmation_and_current_etag(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    state: str,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    other, _, _ = await add_user(sessions, token)
+    expense_id = await create_pending(client, owner)
+    path = f"{ENDPOINT}/{expense_id}"
+    actions = {"confirmed": "confirm", "rejected": "reject"}
+    if state in actions:
+        assert (
+            await client.post(f"{path}/{actions[state]}", headers=owner)
+        ).status_code == 200
+    detail = await client.get(path, headers=owner)
+    assert detail.json()["status"] == state
+    tag = detail.headers["etag"]
+    if state != "pending":
+        assert (
+            await client.patch(
+                path, headers=owner | {"If-Match": tag}, json={"merchant": "X"}
+            )
+        ).status_code == 409
+    assert (await client.delete(path, headers=owner)).status_code == 422
+    confirmed_path = f"{path}?confirm=true"
+    assert (await client.delete(confirmed_path, headers=owner)).status_code == 428
+    assert (
+        await client.delete(confirmed_path, headers=other | {"If-Match": tag})
+    ).status_code == 404
+    assert (
+        await client.delete(confirmed_path, headers=owner | {"If-Match": '"old"'})
+    ).status_code == 412
+    deleted = await client.delete(confirmed_path, headers=owner | {"If-Match": tag})
+    assert deleted.status_code == 204 and not deleted.content
+    assert (await client.get(path, headers=owner)).status_code == 404
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(ExpenseItem)
+                .where(ExpenseItem.expense_id == expense_id)
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_parallel_edits_with_same_tag_only_apply_once(
+    api: tuple[httpx.AsyncClient, str], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    expense_id = await create_pending(client, owner)
+    path = f"{ENDPOINT}/{expense_id}"
+    tag = (await client.get(path, headers=owner)).headers["etag"]
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(
+                client.patch(
+                    path, headers=owner | {"If-Match": tag}, json={"merchant": name}
+                )
+                for name in ("Shop A", "Shop B")
+            )
+        ),
+        timeout=5,
+    )
+    assert sorted(response.status_code for response in results) == [200, 412]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "delete"])
+async def test_pending_confirmation_detects_concurrent_mutation(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    expense_id = await create_pending(client, owner, "USD")
+    path = f"{ENDPOINT}/{expense_id}"
+    tag = (await client.get(path, headers=owner)).headers["etag"]
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def rate(*args: object) -> Decimal:
+        waiting.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
+        return Decimal(2)
+
+    monkeypatch.setattr(nbu, "get_historical_rate", rate)
+    async with asyncio.TaskGroup() as tasks:
+        confirm = tasks.create_task(client.post(f"{path}/confirm", headers=owner))
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        tagged = owner | {"If-Match": tag}
+        if mutation == "edit":
+            response = await client.patch(
+                path,
+                headers=tagged,
+                json={"items": [{"name": "Different", "amount": "2.99"}]},
+            )
+            assert response.status_code == 200
+        else:
+            response = await client.delete(f"{path}?confirm=true", headers=tagged)
+            assert response.status_code == 204
+        release.set()
+        outcome = await confirm
+    assert (outcome.status_code, outcome.json()["detail"]) == (
+        (409, "expense_changed") if mutation == "edit" else (404, "expense_not_found")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "delete"])
+@pytest.mark.parametrize("action", ["reassign", "uncategorize"])
+async def test_category_mutation_changes_tag_without_deadlock(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    action: str,
+) -> None:
+    client, token = api
+    owner, _, source = await add_user(sessions, token)
+    categories = await client.get("/internal/categories", headers=owner)
+    destination = next(row["id"] for row in categories.json() if row["id"] != source)
+    created = await client.post(ENDPOINT, headers=owner, json=payload(source))
+    path = f"{ENDPOINT}/{created.json()['id']}"
+    detail = await client.get(path, headers=owner)
+    tag = detail.headers["etag"]
+    paused = asyncio.Event()
+    release = asyncio.Event()
+    move = item_repository.move_category_items
+
+    async def pause_move(
+        session: AsyncSession, user_id: int, source_id: int, target_id: int | None
+    ) -> None:
+        paused.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
+        await move(session, user_id, source_id, target_id)
+
+    monkeypatch.setattr(item_repository, "move_category_items", pause_move)
+    params = {"action": action}
+    if action == "reassign":
+        params["target_category_id"] = str(destination)
+    async with asyncio.TaskGroup() as tasks:
+        category_delete = tasks.create_task(
+            client.delete(
+                f"/internal/categories/{source}", headers=owner, params=params
+            )
+        )
+        await asyncio.wait_for(paused.wait(), timeout=5)
+        tagged = owner | {"If-Match": tag}
+        request = (
+            client.patch(path, headers=tagged, json={"merchant": "Stale"})
+            if mutation == "edit"
+            else client.delete(f"{path}?confirm=true", headers=tagged)
+        )
+        expense_mutation = tasks.create_task(request)
+        async with asyncio.timeout(5), sessions() as session:
+            while not await session.scalar(
+                text(
+                    "SELECT EXISTS (SELECT FROM pg_locks WHERE NOT granted AND locktype = 'transactionid')"
+                )
+            ):
+                await asyncio.sleep(0.01)
+        release.set()
+        assert (await category_delete).status_code == 204
+        assert (await expense_mutation).status_code == 412
+    current = await client.get(path, headers=owner)
+    assert current.headers["etag"] != tag
+    assert current.json()["items"][0]["category_id"] == (
+        destination if action == "reassign" else None
+    )
 
 
 @pytest.mark.asyncio
