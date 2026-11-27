@@ -9,6 +9,25 @@ from spend_mind.models import Expense
 from spend_mind.models.expense import ExpenseStatus
 
 
+async def get_kyiv_reference(session: AsyncSession) -> tuple[datetime, datetime]:
+    instant = func.now()
+    row = (
+        await session.execute(select(instant, func.timezone("Europe/Kyiv", instant)))
+    ).one()
+    return row[0], row[1]
+
+
+async def resolve_kyiv_local_time(
+    session: AsyncSession, local_time: datetime
+) -> datetime | None:
+    local = cast(local_time, DateTime(timezone=False))
+    instant = func.timezone("Europe/Kyiv", local)
+    row = (
+        await session.execute(select(instant, func.timezone("Europe/Kyiv", instant)))
+    ).one()
+    return row[0] if row[1] == local_time else None
+
+
 async def insert_expense(session: AsyncSession, expense: Expense) -> None:
     session.add(expense)
     await session.flush()

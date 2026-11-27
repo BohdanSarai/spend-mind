@@ -1,9 +1,10 @@
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from secrets import randbits, token_urlsafe
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -14,15 +15,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from spend_mind.config import Settings
 from spend_mind.integrations import nbu
+from spend_mind.integrations.openai import OpenAIErrorKind, OpenAIRequestFailed
 from spend_mind.main import app
 from spend_mind.models import Category, Expense, ExpenseItem
 from spend_mind.repositories import expense as expense_repository
 from spend_mind.repositories import expense_item as item_repository
 from spend_mind.schemas.expense import ExpenseItemCreate
+from spend_mind.schemas.expense_extraction import (
+    ClarificationReason,
+    ExpenseClarification,
+    ExpenseRecognized,
+    ExtractedExpense,
+    ExtractedExpenseItem,
+)
 from spend_mind.services import expense as expense_service
+from spend_mind.services import expense_recognition
 from spend_mind.services.user_registration import register_user
 
 ENDPOINT = "/internal/expenses"
+RECOGNITION = f"{ENDPOINT}/recognize-text"
 
 
 @pytest_asyncio.fixture
@@ -114,6 +125,245 @@ async def create_pending(
     )
     assert response.status_code == 201
     return response.json()["id"]
+
+
+def extraction(**overrides: object) -> ExtractedExpense:
+    return ExtractedExpense.model_validate(
+        {
+            "language": "uk",
+            "clarification_reason": None,
+            "merchant": None,
+            "total_amount": None,
+            "currency": None,
+            "calendar_date": None,
+            "relative_days": None,
+            "local_time": None,
+            "items": [
+                ExtractedExpenseItem(
+                    name="Кава", quantity=None, unit=None, amount="12.35"
+                ),
+                ExtractedExpenseItem(
+                    name="Булочка", quantity="2", unit="шт", amount="2.50"
+                ),
+            ],
+        }
+        | overrides
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "candidate", "expected_date", "expected_currency"),
+    [
+        (
+            "Кава 12,35 і дві булочки разом за 2,50",
+            extraction(),
+            "2026-11-27T22:30:00Z",
+            "UAH",
+        ),
+        (
+            "Yesterday at 09:15, coffee and buns at Market, total EUR 14.85.",
+            extraction(
+                language="en",
+                merchant="Market",
+                total_amount="14.85",
+                currency="EUR",
+                relative_days=-1,
+                local_time="09:15",
+            ),
+            "2026-11-27T07:15:00Z",
+            "EUR",
+        ),
+        (
+            "Учора кава й булочки",
+            extraction(relative_days=-1),
+            "2026-11-26T22:30:00Z",
+            "UAH",
+        ),
+    ],
+)
+async def test_recognition_creates_pending_expense_outside_openai_transaction(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    candidate: ExtractedExpense,
+    expected_date: str,
+    expected_currency: str,
+) -> None:
+    client, token = api
+    owner, user_id, _ = await add_user(sessions, token)
+    service_call = expense_recognition.recognize_text
+    active_session = None
+
+    async def observe_session(
+        session: AsyncSession, telegram_user_id: int, adapter: Mock, text: str
+    ) -> ExpenseRecognized | ExpenseClarification:
+        nonlocal active_session
+        active_session = session
+        return await service_call(session, telegram_user_id, adapter, text)
+
+    async def extract(
+        text: str, *, instructions: str, schema: type[ExtractedExpense]
+    ) -> ExtractedExpense:
+        assert active_session is not None and not active_session.in_transaction()
+        assert text == message
+        assert "untrusted data" in instructions and message not in instructions
+        assert "2026-11-28T00:30:00" in instructions
+        assert schema is ExtractedExpense
+        return candidate
+
+    fixed_clock = AsyncMock(
+        return_value=(
+            datetime(2026, 11, 27, 22, 30, tzinfo=UTC),
+            datetime(2026, 11, 28, 0, 30),
+        )
+    )
+    monkeypatch.setattr(expense_repository, "get_kyiv_reference", fixed_clock)
+    monkeypatch.setattr(expense_recognition, "recognize_text", observe_session)
+    adapter = Mock(create_structured_response=AsyncMock(side_effect=extract))
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    response = await client.post(RECOGNITION, headers=owner, json={"text": message})
+    assert response.status_code == 201, response.text
+    assert response.json()["outcome"] == "created"
+    record = response.json()["expense"]
+    assert record["status"] == "pending" and record["source"] == "text"
+    assert record["currency"] == expected_currency
+    assert record["created_at"] and record["expense_date"] == expected_date
+    assert (
+        record["total_amount"] == "14.85" and record["merchant"] == candidate.merchant
+    )
+    assert [item["quantity"] for item in record["items"]] == ["1", "2"]
+    async with sessions() as session:
+        saved = await session.get(Expense, record["id"])
+        assert saved is not None and saved.user_id == user_id
+        assert saved.total_amount == Decimal("14.85")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        (
+            extraction(clarification_reason=ClarificationReason.MULTIPLE_TRANSACTIONS),
+            "multiple_transactions",
+        ),
+        (
+            extraction(clarification_reason=ClarificationReason.AMBIGUOUS_CURRENCY),
+            "ambiguous_currency",
+        ),
+        (extraction(total_amount="14.84"), "expense_total_mismatch"),
+        (extraction(currency="GBP"), "invalid_financial_data"),
+        (extraction(items=[]), "missing_items"),
+        (
+            extraction(
+                items=[
+                    ExtractedExpenseItem(
+                        name="A", quantity=None, unit=None, amount=None
+                    )
+                ]
+            ),
+            "missing_amount",
+        ),
+        (extraction(calendar_date="2026-03-29", local_time="03:30"), "ambiguous_date"),
+    ],
+)
+async def test_recognition_clarification_leaves_no_expense(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    candidate: ExtractedExpense,
+    expected: str,
+) -> None:
+    client, token = api
+    owner, user_id, _ = await add_user(sessions, token)
+    adapter = Mock(create_structured_response=AsyncMock(return_value=candidate))
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    response = await client.post(RECOGNITION, headers=owner, json={"text": "Кава"})
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "clarification_required"
+    assert response.json()["reason"] == expected
+    assert response.json()["question"]
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Expense)
+                .where(Expense.user_id == user_id)
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_recognition_validates_request_without_echoing_text(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    adapter = Mock(create_structured_response=AsyncMock())
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    assert (await client.post(RECOGNITION, json={"text": "Кава"})).status_code == 401
+    for invalid in (
+        {"text": " "},
+        {"text": "а" * 4001},
+        {"text": "Кава", "user_id": 10},
+    ):
+        response = await client.post(RECOGNITION, headers=owner, json=invalid)
+        assert response.status_code == 422
+        assert response.json() == {"detail": "invalid_expense_recognition_request"}
+    unknown = owner | {"X-Telegram-User-Id": str(2**63 - 1)}
+    assert (
+        await client.post(RECOGNITION, headers=unknown, json={"text": "Кава"})
+    ).status_code == 404
+    adapter.create_structured_response.assert_not_called()
+
+    app.state.openai_responses = None
+    response = await client.post(RECOGNITION, headers=owner, json={"text": "а" * 4000})
+    assert (response.status_code, response.json()["detail"]) == (
+        503,
+        "openai_not_configured",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "status_code"),
+    [
+        (OpenAIErrorKind.REFUSAL, 422),
+        (OpenAIErrorKind.INCOMPLETE, 502),
+        (OpenAIErrorKind.FAILED, 502),
+        (OpenAIErrorKind.INVALID_OUTPUT, 502),
+        (OpenAIErrorKind.TIMEOUT, 503),
+    ],
+)
+async def test_recognition_maps_openai_failures(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    kind: OpenAIErrorKind,
+    status_code: int,
+) -> None:
+    client, token = api
+    owner, user_id, _ = await add_user(sessions, token)
+    adapter = Mock(
+        create_structured_response=AsyncMock(side_effect=OpenAIRequestFailed(kind))
+    )
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    response = await client.post(RECOGNITION, headers=owner, json={"text": "Кава"})
+    assert response.status_code == status_code
+    assert response.json() == {"detail": kind.value}
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Expense)
+                .where(Expense.user_id == user_id)
+            )
+            == 0
+        )
 
 
 @pytest.mark.asyncio

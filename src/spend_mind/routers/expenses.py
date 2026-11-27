@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Literal
 
 from fastapi import (
@@ -8,12 +8,17 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
+    Request,
     Response,
     status,
 )
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from spend_mind.db import get_session
+from spend_mind.integrations.openai import OpenAIErrorKind, OpenAIRequestFailed
 from spend_mind.models.expense import ExpenseStatus
 from spend_mind.routers.dependencies import get_telegram_actor
 from spend_mind.schemas.expense import (
@@ -25,7 +30,12 @@ from spend_mind.schemas.expense import (
     ExpenseResponse,
     ExpenseTransitionResponse,
 )
-from spend_mind.services import expense
+from spend_mind.schemas.expense_extraction import (
+    ExpenseClarification,
+    ExpenseRecognitionRequest,
+    ExpenseRecognized,
+)
+from spend_mind.services import expense, expense_recognition
 
 router = APIRouter(prefix="/internal/expenses")
 ExpenseId = Annotated[int, Path(gt=0, le=2**31 - 1)]
@@ -106,6 +116,73 @@ async def expense_crud_errors() -> AsyncIterator[None]:
 
 
 CRUD_ERRORS = [Depends(expense_crud_errors, scope="function")]
+
+
+class ExpenseRecognitionRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Awaitable[Response]]:
+        handler = super().get_route_handler()
+
+        async def handle(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError:
+                pass
+            # FastAPI's default validation response includes the rejected input.
+            raise HTTPException(
+                status_code=422, detail="invalid_expense_recognition_request"
+            )
+
+        return handle
+
+
+recognition_router = APIRouter(route_class=ExpenseRecognitionRoute)
+
+
+def recognition_error_status(exc: OpenAIRequestFailed) -> int:
+    if exc.kind is OpenAIErrorKind.REFUSAL:
+        return status.HTTP_422_UNPROCESSABLE_CONTENT
+    if exc.kind in {
+        OpenAIErrorKind.TIMEOUT,
+        OpenAIErrorKind.CONNECTION,
+        OpenAIErrorKind.AUTHENTICATION,
+        OpenAIErrorKind.RATE_LIMIT,
+    } or (exc.http_status is not None and exc.http_status >= 500):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    return status.HTTP_502_BAD_GATEWAY
+
+
+@recognition_router.post(
+    "/recognize-text",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ExpenseRecognized,
+    responses={200: {"model": ExpenseClarification}},
+    dependencies=CRUD_ERRORS,
+)
+async def recognize_text(
+    payload: ExpenseRecognitionRequest,
+    request: Request,
+    actor: Actor,
+    session: Session,
+) -> ExpenseRecognized | JSONResponse:
+    client = request.app.state.openai_responses
+    if client is None:
+        raise HTTPException(status_code=503, detail="openai_not_configured")
+    try:
+        result = await expense_recognition.recognize_text(
+            session, actor, client, payload.text
+        )
+    except OpenAIRequestFailed as exc:
+        raise HTTPException(
+            status_code=recognition_error_status(exc), detail=exc.kind.value
+        ) from exc
+    if isinstance(result, ExpenseClarification):
+        return JSONResponse(
+            status_code=status.HTTP_200_OK, content=result.model_dump(mode="json")
+        )
+    return result
+
+
+router.include_router(recognition_router)
 
 
 def require_if_match(if_match: str | None) -> str:
