@@ -21,6 +21,7 @@ from spend_mind.db import get_session
 from spend_mind.integrations.openai import OpenAIErrorKind, OpenAIRequestFailed
 from spend_mind.models.expense import ExpenseStatus
 from spend_mind.routers.dependencies import get_telegram_actor
+from spend_mind.routers.image_upload import read_image_upload
 from spend_mind.schemas.expense import (
     ExpenseCreate,
     ExpenseDetail,
@@ -170,6 +171,50 @@ async def recognize_text(
     try:
         result = await expense_recognition.recognize_text(
             session, actor, client, payload.text
+        )
+    except OpenAIRequestFailed as exc:
+        raise HTTPException(
+            status_code=recognition_error_status(exc), detail=exc.kind.value
+        ) from exc
+    if isinstance(result, ExpenseClarification):
+        return JSONResponse(
+            status_code=status.HTTP_200_OK, content=result.model_dump(mode="json")
+        )
+    return result
+
+
+@recognition_router.post(
+    "/recognize-image",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ExpenseRecognized,
+    responses={200: {"model": ExpenseClarification}},
+    dependencies=CRUD_ERRORS,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["image"],
+                        "properties": {"image": {"type": "string", "format": "binary"}},
+                    }
+                }
+            },
+        }
+    },
+)
+async def recognize_image(
+    request: Request, actor: Actor, session: Session
+) -> ExpenseRecognized | JSONResponse:
+    clock = await expense_recognition.get_recognition_reference(session, actor)
+    client = request.app.state.openai_responses
+    if client is None:
+        raise HTTPException(status_code=503, detail="openai_not_configured")
+    image = await read_image_upload(request)
+    try:
+        result = await expense_recognition.recognize_image(
+            session, actor, client, image.content, image.media_type, clock
         )
     except OpenAIRequestFailed as exc:
         raise HTTPException(

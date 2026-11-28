@@ -13,6 +13,7 @@ from openai import (
     RateLimitError,
 )
 from openai.types.responses import Response
+from openai.types.responses.response_input_param import ResponseInputParam
 from pydantic import BaseModel, ValidationError
 
 from spend_mind.config import Settings
@@ -92,7 +93,11 @@ class OpenAIResponses:
         return response
 
     async def create_structured_response[T: BaseModel](
-        self, input_text: str, *, instructions: str, schema: type[T]
+        self,
+        input_text: str | ResponseInputParam,
+        *,
+        instructions: str,
+        schema: type[T],
     ) -> T:
         # Keep strict schema generation, but inspect the response before parsing
         # the text so truncated JSON still reports an incomplete response.

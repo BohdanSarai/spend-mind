@@ -40,6 +40,11 @@ class ExtractedExpense(BaseModel):
     items: list[ExtractedExpenseItem]
 
 
+class ExtractedImageExpense(ExtractedExpense):
+    receipt_discount: str | None
+    discount_basis: Literal["before_discount", "after_discount"] | None
+
+
 class ExpenseRecognitionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

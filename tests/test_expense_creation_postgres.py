@@ -1,14 +1,17 @@
 import asyncio
 import os
+from base64 import b64encode
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from io import BytesIO
 from secrets import randbits, token_urlsafe
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 import pytest_asyncio
+from PIL import Image
 from sqlalchemy import URL, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -20,6 +23,7 @@ from spend_mind.main import app
 from spend_mind.models import Category, Expense, ExpenseItem
 from spend_mind.repositories import expense as expense_repository
 from spend_mind.repositories import expense_item as item_repository
+from spend_mind.routers import image_upload
 from spend_mind.schemas.expense import ExpenseItemCreate
 from spend_mind.schemas.expense_extraction import (
     ClarificationReason,
@@ -27,6 +31,7 @@ from spend_mind.schemas.expense_extraction import (
     ExpenseRecognized,
     ExtractedExpense,
     ExtractedExpenseItem,
+    ExtractedImageExpense,
 )
 from spend_mind.services import expense as expense_service
 from spend_mind.services import expense_recognition
@@ -34,6 +39,7 @@ from spend_mind.services.user_registration import register_user
 
 ENDPOINT = "/internal/expenses"
 RECOGNITION = f"{ENDPOINT}/recognize-text"
+IMAGE_RECOGNITION = f"{ENDPOINT}/recognize-image"
 
 
 @pytest_asyncio.fixture
@@ -149,6 +155,285 @@ def extraction(**overrides: object) -> ExtractedExpense:
         }
         | overrides
     )
+
+
+def image_bytes() -> bytes:
+    buffer = BytesIO()
+    with Image.new("RGB", (8, 8)) as image:
+        image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def image_extraction(**overrides: object) -> ExtractedImageExpense:
+    return ExtractedImageExpense.model_validate(
+        extraction(
+            language="en",
+            merchant="Market",
+            total_amount="15.00",
+            currency="UAH",
+            calendar_date="2026-11-28",
+            local_time="12:30",
+            items=[
+                ExtractedExpenseItem(
+                    name="Coffee", quantity="1", unit=None, amount="10.00"
+                ),
+                ExtractedExpenseItem(
+                    name="Scone", quantity="2", unit=None, amount="10.00"
+                ),
+            ],
+        ).model_dump()
+        | {"receipt_discount": "5.00", "discount_basis": "before_discount"}
+        | overrides
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("basis", ["before_discount", "after_discount"])
+async def test_image_recognition_persists_owner_and_applies_discount_once(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    basis: str,
+) -> None:
+    client, token = api
+    owner, user_id, _ = await add_user(sessions, token)
+    raw_image = image_bytes()
+    items = image_extraction().items
+    if basis == "after_discount":
+        items = [item.model_copy(update={"amount": "7.50"}) for item in items]
+    result = image_extraction(items=items, discount_basis=basis)
+    active_session = None
+    original = expense_recognition.recognize_image
+
+    async def observe_session(
+        session: AsyncSession, *args: object
+    ) -> ExpenseRecognized | ExpenseClarification:
+        nonlocal active_session
+        active_session = session
+        return await original(session, *args)
+
+    async def extract(
+        inputs: list[dict], *, instructions: str, schema: type[ExtractedImageExpense]
+    ) -> ExtractedImageExpense:
+        assert active_session is not None and not active_session.in_transaction()
+        assert schema is ExtractedImageExpense
+        assert "untrusted data" in instructions
+        assert "Never round, truncate, or drop" in instructions
+        assert "without requesting clarification solely for its absence" in instructions
+        part = inputs[0]["content"][0]
+        assert part["type"] == "input_image"
+        assert part["image_url"].startswith("data:image/png;base64,")
+        return result
+
+    monkeypatch.setattr(expense_recognition, "recognize_image", observe_session)
+    adapter = Mock(create_structured_response=AsyncMock(side_effect=extract))
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    response = await client.post(
+        IMAGE_RECOGNITION,
+        headers=owner,
+        files={"image": ("receipt.txt", raw_image, "text/plain")},
+    )
+    assert response.status_code == 201, response.text
+    record = response.json()["expense"]
+    assert record["status"] == "pending" and record["source"] == "image"
+    assert record["expense_date"] == "2026-11-28T10:30:00Z"
+    assert record["total_amount"] == "15.00"
+    assert [item["amount"] for item in record["items"]] == ["7.50", "7.50"]
+    async with sessions() as session:
+        saved = await session.get(Expense, record["id"])
+        assert saved is not None and saved.user_id == user_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("calendar_date", "local_time", "expected_time"),
+    [
+        (None, None, "2026-11-27T22:30:00Z"),
+        ("2026-11-26", None, "2026-11-25T22:30:00Z"),
+        (None, "12:30", "2026-11-28T10:30:00Z"),
+    ],
+)
+async def test_image_recognition_uses_existing_defaults_for_missing_fields(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    calendar_date: str | None,
+    local_time: str | None,
+    expected_time: str,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    fixed_clock = (
+        datetime(2026, 11, 27, 22, 30, tzinfo=UTC),
+        datetime(2026, 11, 28, 0, 30),
+    )
+    monkeypatch.setattr(
+        expense_repository, "get_kyiv_reference", AsyncMock(return_value=fixed_clock)
+    )
+    candidate = image_extraction(
+        currency=None,
+        calendar_date=calendar_date,
+        local_time=local_time,
+        items=[
+            item.model_copy(update={"quantity": None})
+            for item in image_extraction().items
+        ],
+    )
+    adapter = Mock(create_structured_response=AsyncMock(return_value=candidate))
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    response = await client.post(
+        IMAGE_RECOGNITION,
+        headers=owner,
+        files={"image": ("receipt.png", image_bytes())},
+    )
+    assert response.status_code == 201, response.text
+    record = response.json()["expense"]
+    assert record["expense_date"] == expected_time
+    assert record["currency"] == "UAH"
+    assert [item["quantity"] for item in record["items"]] == ["1", "1"]
+    assert [item["amount"] for item in record["items"]] == ["7.50", "7.50"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "reason", "stage", "diagnostic"),
+    [
+        ({"items": []}, "missing_items", "item_validation", "-"),
+        (
+            {
+                "items": [
+                    ExtractedExpenseItem(
+                        name="Private item", quantity=None, unit=None, amount=None
+                    )
+                ]
+            },
+            "missing_amount",
+            "item_validation",
+            "-",
+        ),
+        ({"discount_basis": None}, "ambiguous_financial_data", "discount_basis", "-"),
+        (
+            {"receipt_discount": "5.005"},
+            "invalid_financial_data",
+            "discount_validation",
+            "receipt_discount:value_error",
+        ),
+        ({"local_time": "25:30"}, "ambiguous_date", "date_validation", "-"),
+        ({"total_amount": "15.01"}, "expense_total_mismatch", "reconciliation", "-"),
+        (
+            {"total_amount": "15,00"},
+            "invalid_financial_data",
+            "expense_validation",
+            "total_amount:value_error",
+        ),
+        (
+            {
+                "items": [
+                    ExtractedExpenseItem(
+                        name="Private item",
+                        quantity="1.2345",
+                        unit=None,
+                        amount="10.001",
+                    )
+                ]
+            },
+            "invalid_financial_data",
+            "expense_validation",
+            "items[].quantity:value_error,items[].amount:value_error",
+        ),
+        (
+            {"clarification_reason": ClarificationReason.AMBIGUOUS_FINANCIAL_DATA},
+            "ambiguous_financial_data",
+            "ai",
+            "-",
+        ),
+    ],
+)
+async def test_image_recognition_requests_clarification_without_writing(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    overrides: dict,
+    reason: str,
+    stage: str,
+    diagnostic: str,
+) -> None:
+    client, token = api
+    owner, user_id, _ = await add_user(sessions, token)
+    adapter = Mock(
+        create_structured_response=AsyncMock(
+            return_value=image_extraction(merchant="Private merchant", **overrides)
+        )
+    )
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    raw_image = image_bytes()
+    response = await client.post(
+        IMAGE_RECOGNITION,
+        headers=owner,
+        files={"image": ("private-payment.png", raw_image)},
+    )
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "clarification_required"
+    assert response.json()["reason"] == reason
+    assert (
+        f"stage={stage} reason={reason} validation_errors={diagnostic}" in caplog.text
+    )
+    for secret in (
+        "Private merchant",
+        "Private item",
+        "private-payment.png",
+        "5.005",
+        "1.2345",
+        "10.001",
+        "15,00",
+        "15.01",
+        "25:30",
+        b64encode(raw_image).decode("ascii"),
+        owner["X-Telegram-User-Id"],
+        token,
+    ):
+        assert secret not in caplog.text
+    async with sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(Expense)
+                .where(Expense.user_id == user_id)
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_image_recognition_checks_owner_before_decode_and_blocks_invalid_files(
+    api: tuple[httpx.AsyncClient, str],
+    sessions: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, token = api
+    owner, _, _ = await add_user(sessions, token)
+    adapter = Mock(create_structured_response=AsyncMock())
+    monkeypatch.setattr(app.state, "openai_responses", adapter, raising=False)
+    validate = Mock(wraps=image_upload.validate_image)
+    monkeypatch.setattr(image_upload, "validate_image", validate)
+    files = {"image": ("receipt.png", image_bytes())}
+    assert (await client.post(IMAGE_RECOGNITION, files=files)).status_code == 401
+    unknown = owner | {"X-Telegram-User-Id": str(2**63 - 1)}
+    assert (
+        await client.post(IMAGE_RECOGNITION, headers=unknown, files=files)
+    ).status_code == 404
+    validate.assert_not_called()
+
+    for content, status in [(b"private document", 415), (b"\xff\xd8\xffprivate", 422)]:
+        response = await client.post(
+            IMAGE_RECOGNITION,
+            headers=owner,
+            files={"image": ("private.png", content, "image/png")},
+        )
+        assert response.status_code == status
+        assert "private" not in response.text
+    adapter.create_structured_response.assert_not_called()
 
 
 @pytest.mark.asyncio

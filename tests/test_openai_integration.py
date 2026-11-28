@@ -15,7 +15,10 @@ from pydantic import SecretStr
 from spend_mind.config import Settings
 from spend_mind.integrations import openai
 from spend_mind.main import lifespan
-from spend_mind.schemas.expense_extraction import ExtractedExpense
+from spend_mind.schemas.expense_extraction import (
+    ExtractedExpense,
+    ExtractedImageExpense,
+)
 
 TEST_KEY = "fake-key-for-mock-transport"
 TEST_INPUT = "Private expense fixture"
@@ -337,6 +340,46 @@ async def test_structured_response_uses_strict_schema_and_separate_instructions(
     )
     assert result.relative_days == -1
     assert result.items[0].amount == "55.25"
+
+
+@pytest.mark.asyncio
+async def test_structured_image_request_passes_image_and_disables_storage(
+    adapter_factory: Callable[..., openai.OpenAIResponses],
+) -> None:
+    image_url = "data:image/png;base64,dGVzdA=="
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = json.loads(request.content)
+        assert body["store"] is False
+        assert body["input"][0]["content"] == [
+            {"type": "input_image", "image_url": image_url, "detail": "high"}
+        ]
+        schema = body["text"]["format"]
+        assert schema["strict"] is True
+        assert "receipt_discount" in schema["schema"]["properties"]
+        assert "discount_basis" in schema["schema"]["properties"]
+        return httpx2.Response(
+            200, json={"id": "resp_test", "object": "response", "status": "incomplete"}
+        )
+
+    with pytest.raises(openai.OpenAIRequestFailed) as caught:
+        await adapter_factory(handler).create_structured_response(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": "high",
+                        }
+                    ],
+                }
+            ],
+            instructions="Extract one receipt.",
+            schema=ExtractedImageExpense,
+        )
+    assert caught.value.kind is openai.OpenAIErrorKind.INCOMPLETE
 
 
 @pytest.mark.asyncio
