@@ -31,12 +31,16 @@ from spend_mind.schemas.expense import (
     ExpenseResponse,
     ExpenseTransitionResponse,
 )
+from spend_mind.schemas.expense_analytics import (
+    ExpenseAnalyticsQuery,
+    ExpenseAnalyticsResponse,
+)
 from spend_mind.schemas.expense_extraction import (
     ExpenseClarification,
     ExpenseRecognitionRequest,
     ExpenseRecognized,
 )
-from spend_mind.services import expense, expense_recognition
+from spend_mind.services import expense, expense_analytics, expense_recognition
 
 router = APIRouter(prefix="/internal/expenses")
 ExpenseId = Annotated[int, Path(gt=0, le=2**31 - 1)]
@@ -117,6 +121,28 @@ async def expense_crud_errors() -> AsyncIterator[None]:
 
 
 CRUD_ERRORS = [Depends(expense_crud_errors, scope="function")]
+
+
+@router.post(
+    "/analyze",
+    dependencies=CRUD_ERRORS,
+    description=(
+        "Analyze confirmed expenses in UAH. Category and product filters select matching "
+        "positions; other filters alone select whole transactions. Item contributions use "
+        "the stored rate and round within each transaction and group, so group totals can "
+        "differ from the summary. For example, two USD 0.01 items in separate groups at "
+        "a rate of 1.5 UAH/USD produce two UAH 0.02 groups and a UAH 0.03 summary. "
+        "A transaction is counted once in the summary and once in each group it contributes to. "
+        "Averages are rounded to two decimal places. Groups are sorted by key, with null keys last."
+    ),
+)
+async def analyze_expenses(
+    query: ExpenseAnalyticsQuery, actor: Actor, session: Session
+) -> ExpenseAnalyticsResponse:
+    try:
+        return await expense_analytics.analyze_expenses_for_actor(session, actor, query)
+    except expense_analytics.AnalyticsCategoryNotFound:
+        raise HTTPException(status_code=404, detail="category_not_found") from None
 
 
 class ExpenseRecognitionRoute(APIRoute):
